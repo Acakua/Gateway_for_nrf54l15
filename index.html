@@ -15,6 +15,7 @@
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background-color: #121212;
             color: #e0e0e0;
+            overflow: hidden;
         }
 
         #header {
@@ -59,6 +60,56 @@
             height: 100%;
             outline: none;
         }
+
+        /* CSS CHO MENU CHUỘT PHẢI */
+        #context-menu {
+            position: absolute;
+            display: none;
+            background: #252525;
+            border: 1px solid #444;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+            z-index: 1000;
+            min-width: 160px;
+            border-radius: 6px;
+            padding: 5px 0;
+        }
+
+        .menu-item {
+            padding: 10px 15px;
+            cursor: pointer;
+            color: #eee;
+            font-size: 14px;
+            position: relative;
+            transition: 0.2s;
+        }
+
+        .menu-item:hover {
+            background: #3d3d3d;
+            color: #4db8ff;
+        }
+
+        /* Submenu cho LED */
+        .submenu {
+            position: absolute;
+            left: 100%;
+            top: 0;
+            display: none;
+            background: #252525;
+            border: 1px solid #444;
+            min-width: 130px;
+            border-radius: 6px;
+            box-shadow: 4px 4px 10px rgba(0, 0, 0, 0.5);
+        }
+
+        .menu-item:hover>.submenu {
+            display: block;
+        }
+
+        .menu-separator {
+            height: 1px;
+            background: #444;
+            margin: 5px 0;
+        }
     </style>
 </head>
 
@@ -70,11 +121,24 @@
 
     <div id="mynetwork"></div>
 
+    <div id="context-menu">
+        <div class="menu-item" onclick="sendCmd('identify')">🔍 Identify Node (Attention)</div>
+        <div class="menu-separator"></div>
+        <div class="menu-item"> Toggle LED ...
+            <div class="submenu">
+                <div class="menu-item" onclick="sendCmd('toggle', 0)">Toggle LED 1</div>
+                <div class="menu-item" onclick="sendCmd('toggle', 1)">Toggle LED 2</div>
+                <div class="menu-item" onclick="sendCmd('toggle', 3)">Toggle LED 4</div>
+            </div>
+        </div>
+    </div>
+
     <script>
         var nodes = new vis.DataSet();
         var edges = new vis.DataSet();
         var container = document.getElementById('mynetwork');
         var data = { nodes: nodes, edges: edges };
+        var selectedNodeId = null; // Lưu trữ node đang được tác động
 
         var options = {
             nodes: {
@@ -83,52 +147,76 @@
                 borderWidth: 2, shadow: true
             },
             edges: {
-                // KHUNG 2: NHÃN DÁN CÓ LỚP GIÁP
                 font: {
-                    size: 11,
-                    align: 'top',          // Đẩy chữ lên trên đường dây (chống lơ lửng)
-                    color: '#cccccc',
-                    strokeWidth: 4,        // Tạo viền dày 4px
-                    strokeColor: '#121212' // Màu viền đen trùng màu nền để tạo "vùng an toàn"
+                    size: 11, align: 'top', color: '#cccccc',
+                    strokeWidth: 4, strokeColor: '#121212'
                 },
-                // KHUNG 1: THUẬT TOÁN BÙNG BINH
                 smooth: {
-                    enabled: true,
-                    type: 'curvedCW', // Ép cong theo chiều kim đồng hồ để tách dây 2 chiều
-                    roundness: 0.15   // Độ cong vừa phải, không quá phình to
+                    enabled: true, type: 'curvedCW', roundness: 0.15
                 },
                 arrows: { to: { enabled: true, scaleFactor: 0.5 } }
             },
             layout: {
                 hierarchical: {
-                    enabled: true,
-                    direction: 'UD',
-                    sortMethod: 'directed',
-                    levelSeparation: 200,
-                    nodeSpacing: 180 // Nới rộng khoảng cách ngang một chút để dây cong không bị chạm nhau
+                    enabled: true, direction: 'UD', sortMethod: 'directed',
+                    levelSeparation: 200, nodeSpacing: 180
                 }
             },
             physics: {
                 hierarchicalRepulsion: {
-                    centralGravity: 0.0,
-                    springLength: 150,
-                    springConstant: 0.01,
-                    nodeDistance: 200,
-                    damping: 0.09
+                    centralGravity: 0.0, springLength: 150, springConstant: 0.01,
+                    nodeDistance: 200, damping: 0.09
                 },
                 solver: 'hierarchicalRepulsion'
             },
             interaction: {
-                hover: true,
-                tooltipDelay: 200,
-                selectConnectedEdges: true
+                hover: true, tooltipDelay: 200, selectConnectedEdges: true
             }
         };
 
         var network = new vis.Network(container, data, options);
 
+        // --- LOGIC XỬ LÝ CHUỘT PHẢI ---
+        network.on("oncontext", function (params) {
+            params.event.preventDefault(); // Chặn menu mặc định của trình duyệt
+            const nodeId = network.getNodeAt(params.pointer.DOM);
+
+            if (nodeId) {
+                // Không cho phép điều khiển chính Gateway (Node 0002)
+                if (nodeId === "0002") return;
+
+                selectedNodeId = nodeId;
+                const menu = document.getElementById("context-menu");
+                menu.style.display = "block";
+                menu.style.left = params.event.pageX + "px";
+                menu.style.top = params.event.pageY + "px";
+            }
+        });
+
+        // Đóng menu khi click trái ra ngoài
+        window.onclick = function () {
+            document.getElementById("context-menu").style.display = "none";
+        };
+
+        // Hàm gửi lệnh qua WebSocket
+        function sendCmd(action, val = null) {
+            if (!ws || ws.readyState !== WebSocket.OPEN || !selectedNodeId) return;
+
+            const payload = {
+                action: action,
+                target: selectedNodeId,
+                led: val
+            };
+
+            ws.send(JSON.stringify(payload));
+            console.log("Downlink Sent:", payload);
+            document.getElementById("context-menu").style.display = "none";
+        }
+
+        // --- LOGIC WEBSOCKET ---
         var ws;
         function connect() {
+            // ĐỊA CHỈ IP CỦA PI
             ws = new WebSocket("ws://192.168.5.113:8000/ws");
 
             ws.onopen = function () {
@@ -139,27 +227,20 @@
 
             ws.onmessage = function (event) {
                 var parsedData = JSON.parse(event.data);
-
                 var newNodes = parsedData.nodes;
                 var newEdges = parsedData.edges;
 
-                // TIÊU ĐIỂM NEON: Can thiệp màu sắc ngay trước khi vẽ
                 newEdges.forEach(e => {
                     e.id = e.from + "-" + e.to;
-
                     if (e.dashes) {
-                        // Nét đứt (Hàng xóm): Bình thường cực kỳ mờ (0.15), khi click sáng lên màu Cam rực rỡ
                         e.color = {
                             color: 'rgba(150, 150, 150, 0.15)',
-                            highlight: '#FFA500',
-                            hover: '#FFA500'
+                            highlight: '#FFA500', hover: '#FFA500'
                         };
                     } else {
-                        // Nét liền (Parent): Bình thường màu Đỏ, khi click sáng lên màu Xanh Neon
                         e.color = {
                             color: '#ff4d4d',
-                            highlight: '#00FFFF',
-                            hover: '#00FFFF'
+                            highlight: '#00FFFF', hover: '#00FFFF'
                         };
                     }
                 });
@@ -181,7 +262,7 @@
                 var statusEl = document.getElementById('ws-status');
                 statusEl.className = 'status-off';
                 statusEl.innerText = 'Mất kết nối... Thử lại sau 2s';
-                setTimeout(function () { connect(); }, 2000);
+                setTimeout(connect, 2000);
             };
 
             ws.onerror = function (err) {
