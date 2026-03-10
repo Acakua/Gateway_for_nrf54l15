@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <title>WSN Topology Dashboard</title>
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #121212;
+            color: #e0e0e0;
+        }
+
+        #header {
+            padding: 15px 25px;
+            background-color: #1e1e1e;
+            border-bottom: 2px solid #333;
+            z-index: 10;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        h2 {
+            margin: 0;
+            font-size: 1.5rem;
+            letter-spacing: 1px;
+            color: #4db8ff;
+        }
+
+        #ws-status {
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        .status-on {
+            background-color: rgba(76, 175, 80, 0.2);
+            color: #4caf50;
+            border: 1px solid #4caf50;
+        }
+
+        .status-off {
+            background-color: rgba(244, 67, 54, 0.2);
+            color: #f44336;
+            border: 1px solid #f44336;
+        }
+
+        #mynetwork {
+            flex: 1;
+            width: 100%;
+            height: 100%;
+            outline: none;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="header">
+        <h2>WSN Gateway - Realtime Topology</h2>
+        <div id="ws-status" class="status-off">Đang ngắt kết nối...</div>
+    </div>
+
+    <div id="mynetwork"></div>
+
+    <script>
+        var nodes = new vis.DataSet();
+        var edges = new vis.DataSet();
+        var container = document.getElementById('mynetwork');
+        var data = { nodes: nodes, edges: edges };
+
+        var options = {
+            nodes: {
+                shape: 'dot',
+                font: { size: 14, color: '#ffffff', face: 'monospace' },
+                borderWidth: 2, shadow: true
+            },
+            edges: {
+                // KHUNG 2: NHÃN DÁN CÓ LỚP GIÁP
+                font: {
+                    size: 11,
+                    align: 'top',          // Đẩy chữ lên trên đường dây (chống lơ lửng)
+                    color: '#cccccc',
+                    strokeWidth: 4,        // Tạo viền dày 4px
+                    strokeColor: '#121212' // Màu viền đen trùng màu nền để tạo "vùng an toàn"
+                },
+                // KHUNG 1: THUẬT TOÁN BÙNG BINH
+                smooth: {
+                    enabled: true,
+                    type: 'curvedCW', // Ép cong theo chiều kim đồng hồ để tách dây 2 chiều
+                    roundness: 0.15   // Độ cong vừa phải, không quá phình to
+                },
+                arrows: { to: { enabled: true, scaleFactor: 0.5 } }
+            },
+            layout: {
+                hierarchical: {
+                    enabled: true,
+                    direction: 'UD',
+                    sortMethod: 'directed',
+                    levelSeparation: 200,
+                    nodeSpacing: 180 // Nới rộng khoảng cách ngang một chút để dây cong không bị chạm nhau
+                }
+            },
+            physics: {
+                hierarchicalRepulsion: {
+                    centralGravity: 0.0,
+                    springLength: 150,
+                    springConstant: 0.01,
+                    nodeDistance: 200,
+                    damping: 0.09
+                },
+                solver: 'hierarchicalRepulsion'
+            },
+            interaction: {
+                hover: true,
+                tooltipDelay: 200,
+                selectConnectedEdges: true
+            }
+        };
+
+        var network = new vis.Network(container, data, options);
+
+        var ws;
+        function connect() {
+            ws = new WebSocket("ws://192.168.5.113:8000/ws");
+
+            ws.onopen = function () {
+                var statusEl = document.getElementById('ws-status');
+                statusEl.className = 'status-on';
+                statusEl.innerText = 'Đã kết nối Live';
+            };
+
+            ws.onmessage = function (event) {
+                var parsedData = JSON.parse(event.data);
+
+                var newNodes = parsedData.nodes;
+                var newEdges = parsedData.edges;
+
+                // TIÊU ĐIỂM NEON: Can thiệp màu sắc ngay trước khi vẽ
+                newEdges.forEach(e => {
+                    e.id = e.from + "-" + e.to;
+
+                    if (e.dashes) {
+                        // Nét đứt (Hàng xóm): Bình thường cực kỳ mờ (0.15), khi click sáng lên màu Cam rực rỡ
+                        e.color = {
+                            color: 'rgba(150, 150, 150, 0.15)',
+                            highlight: '#FFA500',
+                            hover: '#FFA500'
+                        };
+                    } else {
+                        // Nét liền (Parent): Bình thường màu Đỏ, khi click sáng lên màu Xanh Neon
+                        e.color = {
+                            color: '#ff4d4d',
+                            highlight: '#00FFFF',
+                            hover: '#00FFFF'
+                        };
+                    }
+                });
+
+                var existingNodeIds = nodes.getIds();
+                var incomingNodeIds = newNodes.map(n => n.id);
+                var nodesToRemove = existingNodeIds.filter(id => !incomingNodeIds.includes(id));
+                nodes.remove(nodesToRemove);
+                nodes.update(newNodes);
+
+                var existingEdgeIds = edges.getIds();
+                var incomingEdgeIds = newEdges.map(e => e.id);
+                var edgesToRemove = existingEdgeIds.filter(id => !incomingEdgeIds.includes(id));
+                edges.remove(edgesToRemove);
+                edges.update(newEdges);
+            };
+
+            ws.onclose = function (e) {
+                var statusEl = document.getElementById('ws-status');
+                statusEl.className = 'status-off';
+                statusEl.innerText = 'Mất kết nối... Thử lại sau 2s';
+                setTimeout(function () { connect(); }, 2000);
+            };
+
+            ws.onerror = function (err) {
+                ws.close();
+            };
+        }
+
+        connect();
+    </script>
+</body>
+
+</html>
