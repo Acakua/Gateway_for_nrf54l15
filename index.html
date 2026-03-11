@@ -3,6 +3,7 @@
 
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>WSN Topology Dashboard</title>
     <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
     <style>
@@ -16,6 +17,8 @@
             background-color: #121212;
             color: #e0e0e0;
             overflow: hidden;
+            touch-action: none;
+            /* Ngăn chặn Zoom/Scroll mặc định trên điện thoại */
         }
 
         #header {
@@ -61,7 +64,7 @@
             outline: none;
         }
 
-        /* CSS CHO MENU CHUỘT PHẢI */
+        /* CSS CHO MENU ĐIỀU KHIỂN */
         #context-menu {
             position: absolute;
             display: none;
@@ -75,7 +78,8 @@
         }
 
         .menu-item {
-            padding: 10px 15px;
+            padding: 15px;
+            /* Tăng padding để dễ chạm đúp trên mobile */
             cursor: pointer;
             color: #eee;
             font-size: 14px;
@@ -101,7 +105,16 @@
             box-shadow: 4px 4px 10px rgba(0, 0, 0, 0.5);
         }
 
-        .menu-item:hover>.submenu {
+        /* Hỗ trợ mobile: Nếu màn hình hẹp, submenu hiện xuống dưới thay vì bên phải */
+        @media (max-width: 768px) {
+            .submenu {
+                left: 0;
+                top: 100%;
+            }
+        }
+
+        .menu-item:hover>.submenu,
+        .menu-item:active>.submenu {
             display: block;
         }
 
@@ -124,10 +137,11 @@
     <div id="context-menu">
         <div class="menu-item" onclick="sendCmd('identify')">🔍 Identify Node (Attention)</div>
         <div class="menu-separator"></div>
-        <div class="menu-item"> Toggle LED ...
+        <div class="menu-item">💡 Toggle LED ...
             <div class="submenu">
                 <div class="menu-item" onclick="sendCmd('toggle', 0)">Toggle LED 1</div>
                 <div class="menu-item" onclick="sendCmd('toggle', 1)">Toggle LED 2</div>
+                <div class="menu-item" onclick="sendCmd('toggle', 2)">Toggle LED 3</div>
                 <div class="menu-item" onclick="sendCmd('toggle', 3)">Toggle LED 4</div>
             </div>
         </div>
@@ -138,7 +152,7 @@
         var edges = new vis.DataSet();
         var container = document.getElementById('mynetwork');
         var data = { nodes: nodes, edges: edges };
-        var selectedNodeId = null; // Lưu trữ node đang được tác động
+        var selectedNodeId = null;
 
         var options = {
             nodes: {
@@ -176,27 +190,42 @@
 
         var network = new vis.Network(container, data, options);
 
-        // --- LOGIC XỬ LÝ CHUỘT PHẢI ---
-        network.on("oncontext", function (params) {
-            params.event.preventDefault(); // Chặn menu mặc định của trình duyệt
-            const nodeId = network.getNodeAt(params.pointer.DOM);
+        // --- BẮT SỰ KIỆN DOUBLE CLICK (CHẠM ĐÚP) ---
+        network.on("doubleClick", function (params) {
+            // params.nodes chứa mảng các node ID được click trúng
+            if (params.nodes.length > 0) {
+                const nodeId = params.nodes[0];
 
-            if (nodeId) {
                 // Không cho phép điều khiển chính Gateway (Node 0002)
                 if (nodeId === "0002") return;
 
                 selectedNodeId = nodeId;
                 const menu = document.getElementById("context-menu");
                 menu.style.display = "block";
-                menu.style.left = params.event.pageX + "px";
-                menu.style.top = params.event.pageY + "px";
+
+                // Vis.js dùng Hammer.js nên event.center.x/y lấy tọa độ chuẩn nhất cho cả chuột và cảm ứng
+                menu.style.left = params.event.center.x + "px";
+                menu.style.top = params.event.center.y + "px";
             }
         });
 
-        // Đóng menu khi click trái ra ngoài
-        window.onclick = function () {
-            document.getElementById("context-menu").style.display = "none";
+        // Ẩn menu mặc định của trình duyệt nếu nhỡ bấm chuột phải
+        network.on("oncontext", function (params) {
+            params.event.preventDefault();
+        });
+
+        // Đóng menu khi click trái / chạm ra ngoài
+        window.onclick = function (e) {
+            // Tránh việc double click vừa mở menu xong lại bị window.onclick đóng ngay lập tức
+            if (!e.target.closest('.vis-network')) {
+                document.getElementById("context-menu").style.display = "none";
+            }
         };
+
+        // Bắt sự kiện click trên canvas để đóng menu
+        network.on("click", function () {
+            document.getElementById("context-menu").style.display = "none";
+        });
 
         // Hàm gửi lệnh qua WebSocket
         function sendCmd(action, val = null) {
@@ -213,11 +242,12 @@
             document.getElementById("context-menu").style.display = "none";
         }
 
-        // --- LOGIC WEBSOCKET ---
+        // --- LOGIC WEBSOCKET (ĐÃ SỬA IP TỰ ĐỘNG) ---
         var ws;
         function connect() {
-            // ĐỊA CHỈ IP CỦA PI
-            ws = new WebSocket("ws://192.168.5.113:8000/ws");
+            // Lấy IP từ chính địa chỉ trình duyệt đang truy cập
+            const serverHost = window.location.hostname || "localhost";
+            ws = new WebSocket("ws://" + serverHost + ":8000/ws");
 
             ws.onopen = function () {
                 var statusEl = document.getElementById('ws-status');
