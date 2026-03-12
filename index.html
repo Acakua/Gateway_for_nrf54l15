@@ -18,7 +18,6 @@
             color: #e0e0e0;
             overflow: hidden;
             touch-action: none;
-            /* Ngăn chặn Zoom/Scroll mặc định trên điện thoại */
         }
 
         #header {
@@ -64,6 +63,18 @@
             outline: none;
         }
 
+        /* Tùy chỉnh giao diện Tooltip (Hover) của Vis.js */
+        div.vis-tooltip {
+            background-color: rgba(30, 30, 30, 0.95) !important;
+            border: 1px solid #4db8ff !important;
+            border-radius: 6px !important;
+            color: #ffffff !important;
+            font-family: 'Segoe UI', Tahoma, sans-serif !important;
+            font-size: 13px !important;
+            padding: 10px !important;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.5) !important;
+        }
+
         /* CSS CHO MENU ĐIỀU KHIỂN */
         #context-menu {
             position: absolute;
@@ -79,7 +90,6 @@
 
         .menu-item {
             padding: 15px;
-            /* Tăng padding để dễ chạm đúp trên mobile */
             cursor: pointer;
             color: #eee;
             font-size: 14px;
@@ -92,7 +102,6 @@
             color: #4db8ff;
         }
 
-        /* Submenu cho LED */
         .submenu {
             position: absolute;
             left: 100%;
@@ -105,7 +114,6 @@
             box-shadow: 4px 4px 10px rgba(0, 0, 0, 0.5);
         }
 
-        /* Hỗ trợ mobile: Nếu màn hình hẹp, submenu hiện xuống dưới thay vì bên phải */
         @media (max-width: 768px) {
             .submenu {
                 left: 0;
@@ -162,8 +170,11 @@
             },
             edges: {
                 font: {
-                    size: 11, align: 'top', color: '#cccccc',
-                    strokeWidth: 4, strokeColor: '#121212'
+                    size: 11, 
+                    align: 'middle', /* CHỈNH SỬA: Căn giữa để hiển thị 2 dòng (RSSI + Uptime) đẹp hơn */
+                    color: '#cccccc',
+                    strokeWidth: 4, strokeColor: '#121212',
+                    multi: 'html'
                 },
                 smooth: {
                     enabled: true, type: 'curvedCW', roundness: 0.15
@@ -190,62 +201,41 @@
 
         var network = new vis.Network(container, data, options);
 
-        // --- BẮT SỰ KIỆN DOUBLE CLICK (CHẠM ĐÚP) ---
         network.on("doubleClick", function (params) {
-            // params.nodes chứa mảng các node ID được click trúng
             if (params.nodes.length > 0) {
                 const nodeId = params.nodes[0];
-
-                // Không cho phép điều khiển chính Gateway (Node 0002)
                 if (nodeId === "0002") return;
-
                 selectedNodeId = nodeId;
                 const menu = document.getElementById("context-menu");
                 menu.style.display = "block";
-
-                // Vis.js dùng Hammer.js nên event.center.x/y lấy tọa độ chuẩn nhất cho cả chuột và cảm ứng
                 menu.style.left = params.event.center.x + "px";
                 menu.style.top = params.event.center.y + "px";
             }
         });
 
-        // Ẩn menu mặc định của trình duyệt nếu nhỡ bấm chuột phải
         network.on("oncontext", function (params) {
             params.event.preventDefault();
         });
 
-        // Đóng menu khi click trái / chạm ra ngoài
         window.onclick = function (e) {
-            // Tránh việc double click vừa mở menu xong lại bị window.onclick đóng ngay lập tức
             if (!e.target.closest('.vis-network')) {
                 document.getElementById("context-menu").style.display = "none";
             }
         };
 
-        // Bắt sự kiện click trên canvas để đóng menu
         network.on("click", function () {
             document.getElementById("context-menu").style.display = "none";
         });
 
-        // Hàm gửi lệnh qua WebSocket
         function sendCmd(action, val = null) {
             if (!ws || ws.readyState !== WebSocket.OPEN || !selectedNodeId) return;
-
-            const payload = {
-                action: action,
-                target: selectedNodeId,
-                led: val
-            };
-
+            const payload = { action: action, target: selectedNodeId, led: val };
             ws.send(JSON.stringify(payload));
-            console.log("Downlink Sent:", payload);
             document.getElementById("context-menu").style.display = "none";
         }
 
-        // --- LOGIC WEBSOCKET (ĐÃ SỬA IP TỰ ĐỘNG) ---
         var ws;
         function connect() {
-            // Lấy IP từ chính địa chỉ trình duyệt đang truy cập
             const serverHost = window.location.hostname || "localhost";
             ws = new WebSocket("ws://" + serverHost + ":8000/ws");
 
@@ -263,15 +253,9 @@
                 newEdges.forEach(e => {
                     e.id = e.from + "-" + e.to;
                     if (e.dashes) {
-                        e.color = {
-                            color: 'rgba(150, 150, 150, 0.15)',
-                            highlight: '#FFA500', hover: '#FFA500'
-                        };
+                        e.color = { color: 'rgba(150, 150, 150, 0.15)', highlight: '#FFA500', hover: '#FFA500' };
                     } else {
-                        e.color = {
-                            color: '#ff4d4d',
-                            highlight: '#00FFFF', hover: '#00FFFF'
-                        };
+                        e.color = { color: '#ff4d4d', highlight: '#00FFFF', hover: '#00FFFF' };
                     }
                 });
 

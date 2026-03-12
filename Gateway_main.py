@@ -9,7 +9,7 @@ import shutil
 import os
 import networkx as nx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse # THÊM ĐỂ LÀM WEB SERVER
+from fastapi.responses import FileResponse
 import uvicorn
 import asyncio
 
@@ -23,12 +23,10 @@ PAGE_TIMEOUT = 4
 BACKUP_INTERVAL = 300 
 GATEWAY_NODE = "0002" 
 
-# Tạo định danh duy nhất cho mỗi lần khởi động: ví dụ 20260310_174501
 SESSION_ID = time.strftime("%Y%m%d_%H%M%S")
 
 if os.name == 'nt':  
     SERIAL_PORT = r'\\.\COM32' 
-    # File log chính trong RAM Disk (Session-based)
     RAM_DISK_CSV = f'topology_log_{SESSION_ID}.csv' 
     BACKUP_DIR = 'wsn_backup\\' 
 else:                
@@ -36,8 +34,8 @@ else:
     RAM_DISK_CSV = f'/dev/shm/topology_log_{SESSION_ID}.csv' 
     BACKUP_DIR = '/home/pi/wsn_backup/'
 
-TOPO_PATTERN = r"\$\[TOPO\],([0-9A-F]{4}),(\d+),(\d+),(\d+),(\d+),(\d+),([0-9A-F]{4}),(.*)"
-NEIGHBOR_PATTERN = r"\[([0-9A-F]{4}),(-?\d+),(\d+)\]"
+TOPO_PATTERN = r"\$\[TOPO\],([0-9A-F]{4}),(\d+),(\d+),(\d+),(\d+),(\d+),([0-9A-F]{4}),(\d+),(\d+),(\d+),(.*)"
+NEIGHBOR_PATTERN = r"\[([0-9A-F]{4}),(-?\d+),(\d+),(\d+)\]"
 
 # ==========================================
 # BIẾN TOÀN CỤC & KHÓA AN TOÀN
@@ -49,7 +47,7 @@ latest_graph_json = ""
 missed_count_dict = {}
 
 graph_lock = threading.Lock()
-serial_lock = threading.Lock() # Universal Lock bảo vệ UART
+serial_lock = threading.Lock() 
 
 app = FastAPI()
 global_ser = None
@@ -67,7 +65,16 @@ def init_serial():
         os._exit(1)
 
 # ==========================================
-# LUỒNG 1: ĐỌC SERIAL (CÓ KHÓA AN TOÀN)
+# KHUNG SƯỜN TÍNH TOÁN NĂNG LƯỢNG
+# ==========================================
+def estimate_battery(uptime_s, tx_count):
+    W_idle = 0.00005  
+    W_tx = 0.002      
+    battery_left = 100.0 - (uptime_s * W_idle + tx_count * W_tx)
+    return round(max(0.0, min(100.0, battery_left)), 1)
+
+# ==========================================
+# LUỒNG 1: ĐỌC SERIAL
 # ==========================================
 def uart_reader_thread():
     global global_ser
@@ -128,12 +135,16 @@ def data_processor_thread():
             raw_line = uart_queue.get(timeout=0.1)
             match = re.search(TOPO_PATTERN, raw_line)
             if match and collecting_data:
-                origin, seq, total, curr, count, grad, parent, n_str = match.groups()
+                origin, seq, total, curr, count, grad, parent, qld, uptime, tx, n_str = match.groups()
                 neighbors = re.findall(NEIGHBOR_PATTERN, n_str)
-                parsed_nb = [{"addr": n[0], "rssi": int(n[1]), "grad": int(n[2])} for n in neighbors]
+                parsed_nb = [{"addr": n[0], "rssi": int(n[1]), "grad": int(n[2]), "link_uptime": int(n[3])} for n in neighbors]
                 
                 if origin not in page_assembly or page_assembly[origin]['seq'] != int(seq):
-                    page_assembly[origin] = {'seq': int(seq), 'total': int(total), 'pages': {}, 'grad': int(grad), 'parent': parent, 'ts': now}
+                    page_assembly[origin] = {
+                        'seq': int(seq), 'total': int(total), 'pages': {}, 
+                        'grad': int(grad), 'parent': parent, 'ts': now,
+                        'qld': int(qld), 'uptime': int(uptime), 'tx': int(tx)
+                    }
                 
                 page_assembly[origin]['pages'][int(curr)] = parsed_nb
                 page_assembly[origin]['ts'] = now 
@@ -147,19 +158,29 @@ def commit_topology_to_temp(origin):
     all_neighbors = []
     for page_num in sorted(data['pages'].keys()):
         all_neighbors.extend(data['pages'][page_num])
-    current_cycle_data[origin] = {"grad": data['grad'], "parent": data['parent'], "neighbors": all_neighbors, "is_partial": len(data['pages']) < data['total']}
+        
+    pin_est = estimate_battery(data['uptime'], data['tx'])
+    
+    current_cycle_data[origin] = {
+        "grad": data['grad'], 
+        "parent": data['parent'], 
+        "neighbors": all_neighbors, 
+        "is_partial": len(data['pages']) < data['total'],
+        "qld": data['qld'],
+        "pin": pin_est
+    }
 
 def reconcile_master_graph():
     global Master_Graph, latest_graph_json, missed_count_dict
     with graph_lock:
         for node, data in current_cycle_data.items():
             missed_count_dict[node] = 0
-            Master_Graph.add_node(node, grad=data["grad"], color="green")
+            # [SỬA]: Thêm 'qld' và 'pin' vào Node Data của NetworkX
+            Master_Graph.add_node(node, grad=data["grad"], color="green", qld=data["qld"], pin=data["pin"])
             Master_Graph.remove_edges_from([(u, v) for u, v in Master_Graph.edges if u == node])
             for nb in data["neighbors"]:
-                Master_Graph.add_edge(node, nb["addr"], rssi=nb["rssi"], is_parent=(nb["addr"] == data["parent"]))
+                Master_Graph.add_edge(node, nb["addr"], rssi=nb["rssi"], is_parent=(nb["addr"] == data["parent"]), link_uptime=nb["link_uptime"])
         
-        # Xử lý node mất tích
         for node in list(Master_Graph.nodes):
             if node == GATEWAY_NODE: continue
             if node not in current_cycle_data:
@@ -177,25 +198,22 @@ def save_to_csv_ramdisk():
         with open(RAM_DISK_CSV, 'a', newline='') as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(["Timestamp", "Origin", "Grad", "Parent", "Neighbor", "RSSI"])
+                writer.writerow(["Timestamp", "Origin", "Grad", "Parent", "Neighbor", "RSSI", "Link_UP(s)", "QLD(%)", "Pin(%)"])
             for origin, data in current_cycle_data.items():
                 for nb in data["neighbors"]:
-                    writer.writerow([ts, origin, data["grad"], data["parent"], nb["addr"], nb["rssi"]])
+                    writer.writerow([ts, origin, data["grad"], data["parent"], nb["addr"], nb["rssi"], nb["link_uptime"], data["qld"], data["pin"]])
     except Exception as e:
-        print(f"[CSV Error] {e}")
+        pass
 
 def backup_csv_thread():
     if not os.path.exists(BACKUP_DIR): os.makedirs(BACKUP_DIR)
-    print(f"[Backup] Luồng sao lưu snapshot ({BACKUP_INTERVAL}s) đã sẵn sàng.")
     while True:
         time.sleep(BACKUP_INTERVAL)
         if os.path.exists(RAM_DISK_CSV):
-            # Mỗi bản backup có tên riêng: topology_snapshot_20260310_174501_175001.csv
             ts_now = time.strftime("%H%M%S")
             backup_filename = f"topology_snapshot_{SESSION_ID}_{ts_now}.csv"
             try:
                 shutil.copy2(RAM_DISK_CSV, os.path.join(BACKUP_DIR, backup_filename))
-                print(f"[Backup] Đã lưu snapshot mới: {backup_filename}")
             except Exception: pass
 
 # ==========================================
@@ -206,22 +224,33 @@ def graph_to_json():
         nodes = []
         for n, d in Master_Graph.nodes(data=True):
             is_gw = (n == GATEWAY_NODE)
+            
+            # [SỬA]: Tạo HTML Tooltip cho giao diện
+            if is_gw:
+                tooltip_html = "<b>GATEWAY</b><br>Gradient: 0"
+            else:
+                tooltip_html = f"<b>Node: {n}</b><br>Gradient: {d.get('grad', '?')}<br>Tải hàng đợi (QLD): {d.get('qld', '?')}%<br>Dự đoán Pin: {d.get('pin', '?')}%"
+
             nodes.append({
-                "id": n, "label": f"Node {n}\n(Grad: {d.get('grad', 0 if is_gw else '?')})", 
+                "id": n, 
+                "label": f"Node {n}\n(Grad: {d.get('grad', 0 if is_gw else '?')})", 
                 "color": "red" if is_gw else d.get('color', 'blue'),
-                "level": 0 if is_gw else (int(d.get('grad', 3)) if str(d.get('grad')).isdigit() else 3)
+                "level": 0 if is_gw else (int(d.get('grad', 3)) if str(d.get('grad')).isdigit() else 3),
+                "title": tooltip_html # Truyền biến title cho chức năng Hover của Vis.js
             })
+        
         edges = []
         for u, v, d in Master_Graph.edges(data=True):
             is_p = d.get('is_parent')
+            label_text = f"{d.get('rssi')}dBm\n{d.get('link_uptime', '?')}s"
+            
             edges.append({
-                "from": u, "to": v, "label": f"{d.get('rssi')}dBm", 
+                "from": u, "to": v, "label": label_text, 
                 "width": 3 if is_p else 1, "dashes": not is_p, 
                 "color": "red" if is_p else "gray", "physics": is_p
             })
     return json.dumps({"nodes": nodes, "edges": edges})
 
-# --- ROUTE MỚI: TRẢ VỀ FILE GIAO DIỆN ---
 @app.get("/")
 async def get_dashboard():
     return FileResponse("index.html")
