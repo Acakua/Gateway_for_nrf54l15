@@ -403,7 +403,7 @@ def save_to_csv_ramdisk():
                     "Timestamp", "Origin", "Grad", "Parent",
                     "Neighbor", "RSSI", "Link_UP(s)",
                     "Drop_Count", "Fwd_Count", "Drop_Rate(%)", "Pin(%)",
-                    "Routing_Cost"   # [NEW] Per-link Routing_Cost
+                    "Routing_Cost", "AI_Routing_Cost"
                 ])
             for origin, data in current_cycle_data.items():
                 safe_origin = f'="{origin}"'
@@ -411,8 +411,7 @@ def save_to_csv_ramdisk():
                 nb_count = len(data["neighbors"])
                 for nb in data["neighbors"]:
                     safe_neighbor = f'="{nb["addr"]}"'
-                    # [NEW] Tính Routing_Cost per-link (khác nhau cho từng neighbor)
-                    routing_cost = compute_routing_cost_per_link(
+                    heuristic_cost = compute_routing_cost_per_link(
                         grad         = data["grad"],
                         nb_rssi      = nb["rssi"],
                         nb_link_up_s = nb["link_uptime"],
@@ -421,13 +420,24 @@ def save_to_csv_ramdisk():
                         drop_count   = data["drp"],
                         fwd_count    = data["fwdr"],
                         neighbor_count = nb_count,
-                        use_ai       = False # Always log HEURISTIC for training ground truth
+                        use_ai       = False
+                    )
+                    ai_cost = compute_routing_cost_per_link(
+                        grad         = data["grad"],
+                        nb_rssi      = nb["rssi"],
+                        nb_link_up_s = nb["link_uptime"],
+                        drop_rate    = data["drop_rate"],
+                        pin          = data["pin"],
+                        drop_count   = data["drp"],
+                        fwd_count    = data["fwdr"],
+                        neighbor_count = nb_count,
+                        use_ai       = True
                     )
                     writer.writerow([
                         ts, safe_origin, data["grad"], safe_parent,
                         safe_neighbor, nb["rssi"], nb["link_uptime"],
                         data["drp"], data["fwdr"], data["drop_rate"],
-                        data["pin"], routing_cost
+                        data["pin"], heuristic_cost, ai_cost
                     ])
     except Exception as e:
         pass
