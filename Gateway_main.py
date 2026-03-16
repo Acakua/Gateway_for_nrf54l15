@@ -19,8 +19,8 @@ import numpy as np
 # CẤU HÌNH HỆ THỐNG & ĐỊNH DANH PHIÊN (SESSION)
 # ==========================================
 BAUD_RATE = 115200
-POLLING_INTERVAL = 30 
-COLLECTION_WINDOW = 15 
+POLLING_INTERVAL = 60 
+COLLECTION_WINDOW = 30 
 PAGE_TIMEOUT = 4 
 BACKUP_INTERVAL = 300 
 GATEWAY_NODE = "0002" 
@@ -484,10 +484,10 @@ def serialize_graph(g_nx):
         label_text = f"{rssi_val}dBm\nC: {cost}" if not is_v else f"VIRTUAL\nC: {cost}"
         
         # Color Logic:
-        # - AI Optimized & Parent: CYAN (Xanh lơ)
+        # - AI Optimized & Parent: SPRING GREEN (#00FF7F)
         # - Regular Parent: RED
         # - Non-parent: GRAY
-        edge_color = "#00FFFF" if is_ai else ("#ff4d4d" if is_p else "gray")
+        edge_color = "#00FF7F" if is_ai else ("#ff4d4d" if is_p else "gray")
         
         edges.append({
             "from": u, "to": v, "label": label_text, 
