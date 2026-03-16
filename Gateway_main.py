@@ -41,6 +41,12 @@ else:
 TOPO_PATTERN = r"\$\[TOPO\],([0-9A-F]{4}),(\d+),(\d+),(\d+),(\d+),(\d+),([0-9A-F]{4}),(\d+),(\d+),(\d+),(\d+),(.*)"
 NEIGHBOR_PATTERN = r"\[([0-9A-F]{4}),(-?\d+),(\d+),(\d+)\]"
 
+# [NEW] Regex cho các loại log mới từ sink_logger.py
+DATA_LOG_PATTERN = r"CSV_LOG,DATA,([^,]+),([^,]+),(\d+),(\d+),(\d+),(-?\d+)"
+RTT_LOG_PATTERN = r"CSV_LOG,RTT_DATA,([^,]+),(\d+),([\d\.]+)"
+HB_LOG_PATTERN = r"CSV_LOG,HEARTBEAT,([^,]+),([^,]+),(\d+),([\d\.]+)"
+REPORT_LOG_PATTERN = r"CSV_LOG,REPORT,([^,]+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)"
+
 # ==========================================
 # BIẾN TOÀN CỤC & KHÓA AN TOÀN
 # ==========================================
@@ -54,6 +60,13 @@ missed_count_dict = {}
 current_cycle_data = {}          # Fixed global warning
 page_assembly = {}               # Fixed global warning
 pending_commit = False           # Flag for Phase 2 piggyback
+
+# --- [NEW] DATA LOGGING CACHE (Ported from sink_logger.py) ---
+rx_stats = {}           # { src_hex: set(seq) }
+latency_tracker = {}    # { src_hex: rtt_ms }
+node_report_cache = {}  # { src_hex: { 'beacon_tx': val, 'hb_tx': val, ... } }
+latency_sync_cache = {} # { (src_hex, seq): timestamp }
+reported_nodes = set()  # To avoid duplicate reports in one cycle
 
 graph_lock = threading.Lock()
 serial_lock = threading.Lock() 
@@ -145,6 +158,77 @@ def compute_routing_cost_per_link(grad, nb_rssi, nb_link_up_s, drop_rate, pin, d
     total = hop_cost + signal_cost + reliability_cost + battery_cost + stability_cost
     return round(total, 2)
 
+# --- [NEW] HELPER FUNCTIONS FOR CSV_LOG PARSING ---
+def safe_int_convert(val):
+    try:
+        val = str(val).strip()
+        if val.lower().startswith('0x'): return int(val, 16)
+        return int(val)
+    except: return 0
+
+def safe_float_convert(val):
+    try:
+        return float(str(val).strip())
+    except: return 0.0
+
+def handle_csv_log(line):
+    global rx_stats, latency_tracker, node_report_cache, latency_sync_cache, reported_nodes
+    try:
+        if "CSV_LOG," not in line: return
+        raw_data = line.split("CSV_LOG,")[1]
+        parts = raw_data.split(',')
+        if not parts: return
+        log_type = parts[0].strip()
+
+        if log_type == "DATA":
+            if len(parts) >= 4:
+                src_hex = f"0x{safe_int_convert(parts[1]):04x}"
+                seq_val = safe_int_convert(parts[3])
+                if src_hex not in rx_stats: rx_stats[src_hex] = set()
+                rx_stats[src_hex].add(seq_val)
+                latency_sync_cache[(src_hex, seq_val)] = time.time()
+
+        elif log_type == "RTT_DATA":
+            if len(parts) >= 4:
+                src_hex = f"0x{safe_int_convert(parts[1]):04x}"
+                rtt_val = safe_float_convert(parts[3])
+                latency_tracker[src_hex] = rtt_val
+
+        elif log_type == "HEARTBEAT":
+            if len(parts) >= 5:
+                src_hex = f"0x{safe_int_convert(parts[1]):04x}"
+                latency_tracker[src_hex] = safe_float_convert(parts[4])
+
+        elif log_type == "REPORT":
+            if len(parts) >= 7:
+                src_hex = f"0x{safe_int_convert(parts[1]):04x}"
+                
+                # handle optional remote_rx parameter carefully
+                remote_rx_val = safe_int_convert(parts[7]) if len(parts) > 7 else 0
+                
+                node_report_cache[src_hex] = {
+                    'tx_count': safe_int_convert(parts[2]),
+                    'beacon_tx': safe_int_convert(parts[3]),
+                    'hb_tx': safe_int_convert(parts[4]),
+                    'route_changes': safe_int_convert(parts[5]),
+                    'fwd_count': safe_int_convert(parts[6]),
+                    'remote_rx': remote_rx_val
+                }
+
+        elif log_type == "EVENT":
+            if len(parts) >= 2:
+                event_name = parts[1].strip()
+                if "TEST_START" in event_name:
+                    rx_stats.clear()
+                    latency_tracker.clear()
+                    # node_report_cache.clear() # Keep node info, just reset packet stats if needed
+                    latency_sync_cache.clear()
+                    reported_nodes.clear()
+                    print(f"\n[LOGGER] --- NEW TEST SESSION: {event_name} (Caches Cleared) ---")
+
+    except Exception as e:
+        print(f"[LOGGER ERROR] Parsing line {line} -> {e}")
+
 
 # ==========================================
 # KHUNG SƯỜN TÍNH TOÁN NĂNG LƯỢNG
@@ -169,7 +253,7 @@ def uart_reader_thread():
                         line = global_ser.readline().decode('utf-8', errors='ignore').strip()
                         if line:
                             print(f"[RAW UART] {line}")
-                            if "$[TOPO]" in line:
+                            if "$[TOPO]" in line or "CSV_LOG" in line:
                                 uart_queue.put(line)
             time.sleep(0.01)
         except Exception:
@@ -266,6 +350,8 @@ def data_processor_thread():
                 page_assembly[origin]['ts'] = now 
                 if len(page_assembly[origin]['pages']) == int(total):
                     commit_topology_to_temp(origin)
+            elif "CSV_LOG" in raw_line and collecting_data:
+                handle_csv_log(raw_line)
         except queue.Empty: pass
 
 def commit_topology_to_temp(origin):
@@ -403,12 +489,25 @@ def save_to_csv_ramdisk():
                     "Timestamp", "Origin", "Grad", "Parent",
                     "Neighbor", "RSSI", "Link_UP(s)",
                     "Drop_Count", "Fwd_Count", "Drop_Rate(%)", "Pin(%)",
-                    "Routing_Cost", "AI_Routing_Cost"
+                    "Routing_Cost", "AI_Routing_Cost",
+                    "BeaconTx", "HeartbeatTx", "RouteChanges",
+                    "Rx_Unique", "Remote_Rx", "PDR_Percent", "RTT_ms"
                 ])
             for origin, data in current_cycle_data.items():
                 safe_origin = f'="{origin}"'
                 safe_parent = f'="{data["parent"]}"'
                 nb_count = len(data["neighbors"])
+                
+                # [NEW] Get metrics from caches
+                origin_hex = f"0x{int(origin, 16):04x}"
+                report = node_report_cache.get(origin_hex, {})
+                rx_unique = len(rx_stats.get(origin_hex, set()))
+                rtt = latency_tracker.get(origin_hex, 0)
+                
+                remote_rx = report.get('remote_rx', 0)
+                tx_count = report.get('tx_count', 0)
+                pdr = (rx_unique / tx_count * 100.0) if tx_count > 0 else 0.0
+
                 for nb in data["neighbors"]:
                     safe_neighbor = f'="{nb["addr"]}"'
                     heuristic_cost = compute_routing_cost_per_link(
@@ -437,7 +536,14 @@ def save_to_csv_ramdisk():
                         ts, safe_origin, data["grad"], safe_parent,
                         safe_neighbor, nb["rssi"], nb["link_uptime"],
                         data["drp"], data["fwdr"], data["drop_rate"],
-                        data["pin"], heuristic_cost, ai_cost
+                        data["pin"], heuristic_cost, ai_cost,
+                        report.get('beacon_tx', 0),
+                        report.get('hb_tx', 0),
+                        report.get('route_changes', 0),
+                        rx_unique,
+                        remote_rx,
+                        f"{pdr:.2f}",
+                        rtt
                     ])
     except Exception as e:
         pass
