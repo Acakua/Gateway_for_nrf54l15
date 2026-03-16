@@ -56,7 +56,35 @@
             border: 1px solid #f44336;
         }
 
-        #mynetwork {
+        #network-container {
+            display: flex;
+            flex: 1;
+            width: 100%;
+            height: 100%;
+        }
+
+        .network-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            border-right: 2px solid #333;
+        }
+
+        .network-panel:last-child {
+            border-right: none;
+        }
+
+        .panel-header {
+            text-align: center;
+            padding: 10px;
+            background-color: #2a2a2a;
+            color: #ff9800;
+            font-weight: bold;
+            font-size: 1.1rem;
+            border-bottom: 2px solid #333;
+        }
+
+        .mynetwork {
             flex: 1;
             width: 100%;
             height: 100%;
@@ -72,7 +100,7 @@
             font-family: 'Segoe UI', Tahoma, sans-serif !important;
             font-size: 13px !important;
             padding: 10px !important;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.5) !important;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.5) !important;
         }
 
         /* CSS CHO MENU ĐIỀU KHIỂN */
@@ -140,7 +168,16 @@
         <div id="ws-status" class="status-off">Đang ngắt kết nối...</div>
     </div>
 
-    <div id="mynetwork"></div>
+    <div id="network-container">
+        <div class="network-panel">
+            <div class="panel-header">Mạng RRT Hiện Tại (Raw)</div>
+            <div id="mynetwork-before" class="mynetwork"></div>
+        </div>
+        <div class="network-panel">
+            <div class="panel-header">Mạng SDN AI Tối Ưu (Dijkstra)</div>
+            <div id="mynetwork-after" class="mynetwork"></div>
+        </div>
+    </div>
 
     <div id="context-menu">
         <div class="menu-item" onclick="sendCmd('identify')">🔍 Identify Node (Attention)</div>
@@ -149,17 +186,22 @@
             <div class="submenu">
                 <div class="menu-item" onclick="sendCmd('toggle', 0)">Toggle LED 1</div>
                 <div class="menu-item" onclick="sendCmd('toggle', 1)">Toggle LED 2</div>
-                <div class="menu-item" onclick="sendCmd('toggle', 2)">Toggle LED 3</div>
                 <div class="menu-item" onclick="sendCmd('toggle', 3)">Toggle LED 4</div>
             </div>
         </div>
     </div>
 
     <script>
-        var nodes = new vis.DataSet();
-        var edges = new vis.DataSet();
-        var container = document.getElementById('mynetwork');
-        var data = { nodes: nodes, edges: edges };
+        var nodesBefore = new vis.DataSet();
+        var edgesBefore = new vis.DataSet();
+        var nodesAfter = new vis.DataSet();
+        var edgesAfter = new vis.DataSet();
+        
+        var containerBefore = document.getElementById('mynetwork-before');
+        var containerAfter = document.getElementById('mynetwork-after');
+
+        var dataBefore = { nodes: nodesBefore, edges: edgesBefore };
+        var dataAfter = { nodes: nodesAfter, edges: edgesAfter };
         var selectedNodeId = null;
 
         var options = {
@@ -170,8 +212,8 @@
             },
             edges: {
                 font: {
-                    size: 11, 
-                    align: 'middle', /* CHỈNH SỬA: Căn giữa để hiển thị 2 dòng (RSSI + Uptime) đẹp hơn */
+                    size: 11,
+                    align: 'middle',
                     color: '#cccccc',
                     strokeWidth: 4, strokeColor: '#121212',
                     multi: 'html'
@@ -199,9 +241,10 @@
             }
         };
 
-        var network = new vis.Network(container, data, options);
+        var networkBefore = new vis.Network(containerBefore, dataBefore, options);
+        var networkAfter = new vis.Network(containerAfter, dataAfter, options);
 
-        network.on("doubleClick", function (params) {
+        function handleDoubleClick(params) {
             if (params.nodes.length > 0) {
                 const nodeId = params.nodes[0];
                 if (nodeId === "0002") return;
@@ -211,11 +254,13 @@
                 menu.style.left = params.event.center.x + "px";
                 menu.style.top = params.event.center.y + "px";
             }
-        });
+        }
 
-        network.on("oncontext", function (params) {
-            params.event.preventDefault();
-        });
+        networkBefore.on("doubleClick", handleDoubleClick);
+        networkAfter.on("doubleClick", handleDoubleClick);
+
+        networkBefore.on("oncontext", function (params) { params.event.preventDefault(); });
+        networkAfter.on("oncontext", function (params) { params.event.preventDefault(); });
 
         window.onclick = function (e) {
             if (!e.target.closest('.vis-network')) {
@@ -223,9 +268,8 @@
             }
         };
 
-        network.on("click", function () {
-            document.getElementById("context-menu").style.display = "none";
-        });
+        networkBefore.on("click", function () { document.getElementById("context-menu").style.display = "none"; });
+        networkAfter.on("click", function () { document.getElementById("context-menu").style.display = "none"; });
 
         function sendCmd(action, val = null) {
             if (!ws || ws.readyState !== WebSocket.OPEN || !selectedNodeId) return;
@@ -246,30 +290,48 @@
             };
 
             ws.onmessage = function (event) {
-                var parsedData = JSON.parse(event.data);
-                var newNodes = parsedData.nodes;
-                var newEdges = parsedData.edges;
+                var payload = JSON.parse(event.data);
+                
+                function updateGraph(graphData, nodesDataset, edgesDataset) {
+                    var newNodes = graphData.nodes || [];
+                    var newEdges = graphData.edges || [];
 
-                newEdges.forEach(e => {
-                    e.id = e.from + "-" + e.to;
-                    if (e.dashes) {
-                        e.color = { color: 'rgba(150, 150, 150, 0.15)', highlight: '#FFA500', hover: '#FFA500' };
-                    } else {
-                        e.color = { color: '#ff4d4d', highlight: '#00FFFF', hover: '#00FFFF' };
-                    }
-                });
+                    newEdges.forEach(e => {
+                        e.id = e.from + "-" + e.to;
+                        // Use color from server if provided, otherwise fallback
+                        if (!e.color) {
+                            if (e.dashes) {
+                                e.color = { color: 'rgba(150, 150, 150, 0.15)', highlight: '#FFA500', hover: '#FFA500' };
+                            } else {
+                                e.color = { color: '#ff4d4d', highlight: '#00FFFF', hover: '#00FFFF' };
+                            }
+                        } else if (typeof e.color === 'string') {
+                            // If server sent a hex string, wrap it for Vis.js highlight support
+                            const baseColor = e.color;
+                            e.color = { color: baseColor, highlight: '#00FFFF', hover: '#00FFFF' };
+                        }
+                    });
 
-                var existingNodeIds = nodes.getIds();
-                var incomingNodeIds = newNodes.map(n => n.id);
-                var nodesToRemove = existingNodeIds.filter(id => !incomingNodeIds.includes(id));
-                nodes.remove(nodesToRemove);
-                nodes.update(newNodes);
+                    var existingNodeIds = nodesDataset.getIds();
+                    var incomingNodeIds = newNodes.map(n => n.id);
+                    var nodesToRemove = existingNodeIds.filter(id => !incomingNodeIds.includes(id));
+                    nodesDataset.remove(nodesToRemove);
+                    nodesDataset.update(newNodes);
 
-                var existingEdgeIds = edges.getIds();
-                var incomingEdgeIds = newEdges.map(e => e.id);
-                var edgesToRemove = existingEdgeIds.filter(id => !incomingEdgeIds.includes(id));
-                edges.remove(edgesToRemove);
-                edges.update(newEdges);
+                    var existingEdgeIds = edgesDataset.getIds();
+                    var incomingEdgeIds = newEdges.map(e => e.id);
+                    var edgesToRemove = existingEdgeIds.filter(id => !incomingEdgeIds.includes(id));
+                    edgesDataset.remove(edgesToRemove);
+                    edgesDataset.update(newEdges);
+                }
+
+                if(payload.before && payload.after) {
+                    updateGraph(payload.before, nodesBefore, edgesBefore);
+                    updateGraph(payload.after, nodesAfter, edgesAfter);
+                } else {
+                    // Fallback to old format just in case
+                    updateGraph(payload, nodesBefore, edgesBefore);
+                }
             };
 
             ws.onclose = function (e) {

@@ -12,6 +12,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 import uvicorn
 import asyncio
+import lightgbm as lgb
+import numpy as np
 
 # ==========================================
 # CẤU HÌNH HỆ THỐNG & ĐỊNH DANH PHIÊN (SESSION)
@@ -34,7 +36,9 @@ else:
     RAM_DISK_CSV = f'/dev/shm/topology_log_{SESSION_ID}.csv' 
     BACKUP_DIR = '/home/pi/wsn_backup/'
 
-TOPO_PATTERN = r"\$\[TOPO\],([0-9A-F]{4}),(\d+),(\d+),(\d+),(\d+),(\d+),([0-9A-F]{4}),(\d+),(\d+),(\d+),(.*)"
+# [UPD]: Regex bắt 11 nhóm (Drop_Count giờ là uint16, max 65535)
+# Format: $[TOPO],Origin,Seq,TotalPg,CurPg,Count,Grad,Parent,Drp(u16),FwdR(u16),Uptime(u32),TotalSent(u32),[neighbors]
+TOPO_PATTERN = r"\$\[TOPO\],([0-9A-F]{4}),(\d+),(\d+),(\d+),(\d+),(\d+),([0-9A-F]{4}),(\d+),(\d+),(\d+),(\d+),(.*)"
 NEIGHBOR_PATTERN = r"\[([0-9A-F]{4}),(-?\d+),(\d+),(\d+)\]"
 
 # ==========================================
@@ -42,12 +46,46 @@ NEIGHBOR_PATTERN = r"\[([0-9A-F]{4}),(-?\d+),(\d+),(\d+)\]"
 # ==========================================
 uart_queue = queue.Queue() 
 ws_clients = set() 
-Master_Graph = nx.DiGraph()
+Master_Graph = nx.DiGraph()      # Before Dijkstra (Raw Topology)
+SDN_Graph = nx.DiGraph()         # After Dijkstra (Optimized Topology)
+AI_Model = None                  # LightGBM Model Instance
 latest_graph_json = ""
 missed_count_dict = {}
+current_cycle_data = {}          # Fixed global warning
+page_assembly = {}               # Fixed global warning
+pending_commit = False           # Flag for Phase 2 piggyback
 
 graph_lock = threading.Lock()
 serial_lock = threading.Lock() 
+
+# ------------------------------------------
+# LOAD AI MODEL
+# ------------------------------------------
+# Lấy đường dẫn tuyệt đối tới thư mục chứa file script
+BASE_DIR = os.path.dirname(__file__)
+
+# Danh sách các đường dẫn khả thi để tìm model
+POSSIBLE_PATHS = [
+    os.path.join(BASE_DIR, 'routing_cost_model.txt'),           # Hiện tại trên Pi của bạn
+    os.path.join(BASE_DIR, 'ml_training', 'routing_cost_model.txt') # Cấu trúc chuẩn trong repo
+]
+
+AI_Model = None
+MODEL_LOADED_PATH = None
+
+for path in POSSIBLE_PATHS:
+    if os.path.exists(path):
+        try:
+            AI_Model = lgb.Booster(model_file=path)
+            MODEL_LOADED_PATH = path
+            print(f"[Hệ Thống] Đã tải model AI LightGBM thành công từ: {path}")
+            break
+        except Exception as e:
+            print(f"[CẢNH BÁO] Lỗi khi load model tại {path}: {e}")
+
+if AI_Model is None:
+    print(f"[CẢNH BÁO] Không tìm thấy file model tại các vị trí: {POSSIBLE_PATHS}")
+    print("[Hệ Thống] Sẽ dùng heuristic fallback để tính toán routing cost.")
 
 app = FastAPI()
 global_ser = None
@@ -63,6 +101,50 @@ def init_serial():
     except Exception as e:
         print(f"[LỖI CHÍ MẠNG] Serial Error: {e}")
         os._exit(1)
+
+# ==========================================
+# TÍNH TOÁN ROUTING COST PER-LINK (MỖI HÀNG CSV)
+# ==========================================
+import math
+
+def compute_routing_cost_per_link(grad, nb_rssi, nb_link_up_s, drop_rate, pin, drop_count, fwd_count, neighbor_count, use_ai=True):
+    """
+    Tính Routing_Cost cho TỪNG LINK riêng biệt (per-neighbor), đảm bảo mỗi
+    hàng CSV có giá trị khác nhau dựa vào RSSI và Link_UP của neighbor đó.
+
+    Dùng Model LightGBM (10 features) nếu có, nếu không thì fallback về Heuristic.
+    """
+    if use_ai and AI_Model is not None:
+        try:
+            # Features derived to match training:
+            # ['Grad', 'RSSI', 'Link_UP(s)', 'Drop_Count', 'Fwd_Count', 
+            #  'Drop_Rate(%)', 'Pin(%)', 'Neighbor_Count', 'Link_Stability', 'Load_Per_Neighbor']
+            link_stability = math.log1p(nb_link_up_s)
+            load_per_neighbor = fwd_count / (neighbor_count + 1)
+
+            features = np.array([[
+                grad, nb_rssi, nb_link_up_s, drop_count, fwd_count,
+                drop_rate, pin, neighbor_count, link_stability, load_per_neighbor
+            ]])
+            pred_cost = AI_Model.predict(features)[0]
+            return round(pred_cost, 2)
+        except Exception as e:
+            pass # Fallback to heuristic
+
+    hop_cost = grad * 10.0
+    signal_cost = max(0.0, (-nb_rssi - 70.0)) * 2.5
+    reliability_cost = min(400.0, pow(drop_rate, 1.5)) if drop_rate > 0 else 0.0
+    if pin < 20.0:
+        battery_cost = 200.0
+    elif pin < 60.0:
+        battery_cost = (60.0 - pin) * 1.5
+    else:
+        battery_cost = 0.0
+    
+    stability_cost = 100.0 * math.exp(-nb_link_up_s / 300.0)
+    total = hop_cost + signal_cost + reliability_cost + battery_cost + stability_cost
+    return round(total, 2)
+
 
 # ==========================================
 # KHUNG SƯỜN TÍNH TOÁN NĂNG LƯỢNG
@@ -106,9 +188,35 @@ def send_uart_command(cmd):
             print(f"[UART TX] Lỗi: {e}")
 
 # ==========================================
-# LUỒNG 2: XỬ LÝ LOGIC & SAO LƯU THÔNG MINH
+# LUỒNG 2: XỬ LÝ LOGIC, ĐỊNH TUYẾN & SAO LƯU
 # ==========================================
+def execute_hybrid_push(delta_nodes):
+    global pending_commit
+    K = len(delta_nodes)
+    print(f"\n[AI SDN] Phát hiện {K} node cần thay đổi Next-Hop.")
+    
+    if K == 0:
+        return
+        
+    if K <= 13:
+        print("[AI SDN] K <= 13 -> Dùng chiến lược UNICAST đẩy lệnh.")
+        for node, new_parent in delta_nodes:
+            payload = 0x8000 | int(new_parent, 16)
+            cmd = f"mesh backprop {node} {payload}"
+            send_uart_command(cmd)
+            time.sleep(0.5) 
+    else:
+        print(f"[AI SDN] K = {K} > 13 -> Dùng chiến lược BROADCAST gộp lệnh.")
+        hex_payload = ""
+        for node, new_parent in delta_nodes:
+            hex_payload += f"{node}{new_parent}"
+        cmd = f"mesh backprop_broadcast {hex_payload}"
+        send_uart_command(cmd)
+        
+    pending_commit = True
+
 def data_processor_thread():
+    global current_cycle_data, page_assembly, pending_commit
     print("[Luồng 2] Khởi động Xử lý Dữ liệu")
     last_polling_time = time.time()
     collecting_data = False
@@ -120,7 +228,13 @@ def data_processor_thread():
         now = time.time()
         if now - last_polling_time >= POLLING_INTERVAL:
             print("\n=======================================")
-            send_uart_command("mesh topo_req")
+            if pending_commit:
+                print("[SDN 2PC] Kích đúp cờ COMMIT vào bản tin topo_req (Phase 2)")
+                send_uart_command("mesh topo_req 1")
+                pending_commit = False
+            else:
+                send_uart_command("mesh topo_req 0")
+            
             current_cycle_data.clear()
             page_assembly.clear()
             collecting_data = True
@@ -135,7 +249,8 @@ def data_processor_thread():
             raw_line = uart_queue.get(timeout=0.1)
             match = re.search(TOPO_PATTERN, raw_line)
             if match and collecting_data:
-                origin, seq, total, curr, count, grad, parent, qld, uptime, tx, n_str = match.groups()
+                # [SỬA]: Lấy đúng 11 tham số từ Regex
+                origin, seq, total, curr, count, grad, parent, drp, fwdr, uptime, total_sent, n_str = match.groups()
                 neighbors = re.findall(NEIGHBOR_PATTERN, n_str)
                 parsed_nb = [{"addr": n[0], "rssi": int(n[1]), "grad": int(n[2]), "link_uptime": int(n[3])} for n in neighbors]
                 
@@ -143,7 +258,8 @@ def data_processor_thread():
                     page_assembly[origin] = {
                         'seq': int(seq), 'total': int(total), 'pages': {}, 
                         'grad': int(grad), 'parent': parent, 'ts': now,
-                        'qld': int(qld), 'uptime': int(uptime), 'tx': int(tx)
+                        'drp': int(drp), 'fwdr': int(fwdr), 
+                        'uptime': int(uptime), 'total_sent': int(total_sent)
                     }
                 
                 page_assembly[origin]['pages'][int(curr)] = parsed_nb
@@ -159,27 +275,51 @@ def commit_topology_to_temp(origin):
     for page_num in sorted(data['pages'].keys()):
         all_neighbors.extend(data['pages'][page_num])
         
-    pin_est = estimate_battery(data['uptime'], data['tx'])
+    pin_est = estimate_battery(data['uptime'], data['total_sent'])
+    
+    # [SỬA]: Feature Engineering - Tính tỷ lệ Drop Rate (%) cho ML
+    total_processed = data['drp'] + data['fwdr']
+    drop_rate = 0.0
+    if total_processed > 0:
+        drop_rate = round((data['drp'] / total_processed) * 100.0, 1)
     
     current_cycle_data[origin] = {
         "grad": data['grad'], 
         "parent": data['parent'], 
         "neighbors": all_neighbors, 
         "is_partial": len(data['pages']) < data['total'],
-        "qld": data['qld'],
+        "drp": data['drp'],
+        "fwdr": data['fwdr'],
+        "drop_rate": drop_rate,
         "pin": pin_est
     }
 
 def reconcile_master_graph():
-    global Master_Graph, latest_graph_json, missed_count_dict
+    global Master_Graph, SDN_Graph, latest_graph_json, missed_count_dict
     with graph_lock:
         for node, data in current_cycle_data.items():
             missed_count_dict[node] = 0
-            # [SỬA]: Thêm 'qld' và 'pin' vào Node Data của NetworkX
-            Master_Graph.add_node(node, grad=data["grad"], color="green", qld=data["qld"], pin=data["pin"])
+            
+            Master_Graph.add_node(node, grad=data["grad"], color="green", drp=data["drp"], fwdr=data["fwdr"], drop_rate=data["drop_rate"], pin=data["pin"])
             Master_Graph.remove_edges_from([(u, v) for u, v in Master_Graph.edges if u == node])
+            nb_count = len(data["neighbors"])
             for nb in data["neighbors"]:
-                Master_Graph.add_edge(node, nb["addr"], rssi=nb["rssi"], is_parent=(nb["addr"] == data["parent"]), link_uptime=nb["link_uptime"])
+                edge_cost = compute_routing_cost_per_link(
+                    grad=data["grad"], nb_rssi=nb["rssi"], nb_link_up_s=nb["link_uptime"], 
+                    drop_rate=data["drop_rate"], pin=data["pin"],
+                    drop_count=data["drp"], fwd_count=data["fwdr"], neighbor_count=nb_count,
+                    use_ai=False # Raw View uses Heuristic Formula
+                )
+                Master_Graph.add_edge(node, nb["addr"], rssi=nb["rssi"], is_parent=(nb["addr"] == data["parent"]), 
+                                      link_uptime=nb["link_uptime"], cost=edge_cost)
+            
+            # [FIX] Force-add Reported Parent edge if it's missing (e.g. not in neighbor list due to overflow)
+            parent = data["parent"]
+            if parent != "0000" and parent != "ffff":
+                if not Master_Graph.has_edge(node, parent):
+                    Master_Graph.add_edge(node, parent, rssi=-99, is_parent=True, link_uptime=0, cost=999, is_virtual=True)
+                else:
+                    Master_Graph[node][parent]['is_parent'] = True
         
         for node in list(Master_Graph.nodes):
             if node == GATEWAY_NODE: continue
@@ -189,6 +329,67 @@ def reconcile_master_graph():
                     Master_Graph.remove_node(node)
                 else:
                     Master_Graph.nodes[node]['color'] = 'yellow'
+                    
+        # --- SDN OPTIMIZATION (DIJKSTRA) ---
+        SDN_Graph = Master_Graph.copy()
+        for node in list(SDN_Graph.nodes):
+            if node == GATEWAY_NODE: continue
+            
+            # [NEW] Recalculate costs for SDN Graph using AI predictions
+            if node in current_cycle_data:
+                data = current_cycle_data[node]
+                nb_count = len(data["neighbors"])
+                for u, v, d in list(SDN_Graph.edges(node, data=True)):
+                    # Find neighbor data to get specific link_uptime/rssi
+                    nb_data = next((n for n in data["neighbors"] if n["addr"] == v), None)
+                    if nb_data:
+                        ai_cost = compute_routing_cost_per_link(
+                            grad=data["grad"], nb_rssi=nb_data["rssi"], nb_link_up_s=nb_data["link_uptime"],
+                            drop_rate=data["drop_rate"], pin=data["pin"],
+                            drop_count=data["drp"], fwd_count=data["fwdr"], neighbor_count=nb_count,
+                            use_ai=True # SDN View uses AI Prediction
+                        )
+                        SDN_Graph[u][v]['cost'] = ai_cost
+
+            try:
+                # Find shortest path from node to Gateway using AI cost
+                path = nx.shortest_path(SDN_Graph, source=node, target=GATEWAY_NODE, weight='cost')
+                best_parent = path[1] if len(path) > 1 else None
+                
+                # Update Edge styles in SDN Graph to reflect the new parent
+                for u, v, d in SDN_Graph.edges(data=True):
+                    if u == node:
+                        SDN_Graph[u][v]['is_parent'] = (v == best_parent)
+            except nx.NetworkXNoPath:
+                pass # Unreachable
+                
+        # --- DELTA FILTERING AND HYBRID PUSH ---
+        delta_nodes = []
+        for node in SDN_Graph.nodes:
+            if node == GATEWAY_NODE: continue
+            
+            ai_parent = None
+            for u, v, d in SDN_Graph.edges(data=True):
+                if u == node and d.get('is_parent', False):
+                    ai_parent = v
+                    break
+            
+            # [NEW] Check if the ACTUAL parent reported by node matches AI recommendation
+            actual_parent = None
+            if node in Master_Graph:
+                for u, v, d in Master_Graph.edges(data=True):
+                    if u == node and d.get('is_parent', False):
+                        actual_parent = v
+                        # If matches AI, mark for styling
+                        Master_Graph[u][v]['is_ai_optimized'] = (v == ai_parent)
+                        break
+                    
+            if ai_parent and actual_parent and ai_parent != actual_parent:
+                delta_nodes.append((node, ai_parent))
+                
+        if len(delta_nodes) > 0:
+            threading.Thread(target=execute_hybrid_push, args=(delta_nodes,), daemon=True).start()
+                
     latest_graph_json = graph_to_json()
 
 def save_to_csv_ramdisk():
@@ -198,10 +399,36 @@ def save_to_csv_ramdisk():
         with open(RAM_DISK_CSV, 'a', newline='') as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(["Timestamp", "Origin", "Grad", "Parent", "Neighbor", "RSSI", "Link_UP(s)", "QLD(%)", "Pin(%)"])
+                writer.writerow([
+                    "Timestamp", "Origin", "Grad", "Parent",
+                    "Neighbor", "RSSI", "Link_UP(s)",
+                    "Drop_Count", "Fwd_Count", "Drop_Rate(%)", "Pin(%)",
+                    "Routing_Cost"   # [NEW] Per-link Routing_Cost
+                ])
             for origin, data in current_cycle_data.items():
+                safe_origin = f'="{origin}"'
+                safe_parent = f'="{data["parent"]}"'
+                nb_count = len(data["neighbors"])
                 for nb in data["neighbors"]:
-                    writer.writerow([ts, origin, data["grad"], data["parent"], nb["addr"], nb["rssi"], nb["link_uptime"], data["qld"], data["pin"]])
+                    safe_neighbor = f'="{nb["addr"]}"'
+                    # [NEW] Tính Routing_Cost per-link (khác nhau cho từng neighbor)
+                    routing_cost = compute_routing_cost_per_link(
+                        grad         = data["grad"],
+                        nb_rssi      = nb["rssi"],
+                        nb_link_up_s = nb["link_uptime"],
+                        drop_rate    = data["drop_rate"],
+                        pin          = data["pin"],
+                        drop_count   = data["drp"],
+                        fwd_count    = data["fwdr"],
+                        neighbor_count = nb_count,
+                        use_ai       = False # Always log HEURISTIC for training ground truth
+                    )
+                    writer.writerow([
+                        ts, safe_origin, data["grad"], safe_parent,
+                        safe_neighbor, nb["rssi"], nb["link_uptime"],
+                        data["drp"], data["fwdr"], data["drop_rate"],
+                        data["pin"], routing_cost
+                    ])
     except Exception as e:
         pass
 
@@ -219,37 +446,51 @@ def backup_csv_thread():
 # ==========================================
 # LUỒNG 3: FASTAPI & WEBSOCKETS CÓ WEB SERVER
 # ==========================================
+def serialize_graph(g_nx):
+    nodes = []
+    for n, d in g_nx.nodes(data=True):
+        is_gw = (n == GATEWAY_NODE)
+        if is_gw:
+            tooltip_html = "<b>GATEWAY</b><br>Gradient: 0"
+        else:
+            tooltip_html = f"<b>Node: {n}</b><br>Gradient: {d.get('grad', '?')}<br>Mất gói (Drop): {d.get('drop_rate', 0.0)}%<br>Thông lượng: {d.get('fwdr', 0)} pkt/30s<br>Dự đoán Pin: {d.get('pin', '?')}%"
+
+        nodes.append({
+            "id": n, 
+            "label": f"Node {n}\n(Grad: {d.get('grad', 0 if is_gw else '?')})", 
+            "color": "red" if is_gw else d.get('color', 'blue'),
+            "level": 0 if is_gw else (int(d.get('grad', 3)) if str(d.get('grad')).isdigit() else 3),
+            "title": tooltip_html 
+        })
+    
+    edges = []
+    for u, v, d in g_nx.edges(data=True):
+        is_p = d.get('is_parent')
+        is_ai = d.get('is_ai_optimized', False)
+        is_v = d.get('is_virtual', False)
+        cost = d.get('cost', '?')
+        
+        rssi_val = d.get('rssi')
+        label_text = f"{rssi_val}dBm\nC: {cost}" if not is_v else f"VIRTUAL\nC: {cost}"
+        
+        # Color Logic:
+        # - AI Optimized & Parent: CYAN (Xanh lơ)
+        # - Regular Parent: RED
+        # - Non-parent: GRAY
+        edge_color = "#00FFFF" if is_ai else ("#ff4d4d" if is_p else "gray")
+        
+        edges.append({
+            "from": u, "to": v, "label": label_text, 
+            "width": 3 if is_p else 1, "dashes": not is_p, 
+            "color": edge_color, "physics": is_p
+        })
+    return {"nodes": nodes, "edges": edges}
+
 def graph_to_json():
     with graph_lock:
-        nodes = []
-        for n, d in Master_Graph.nodes(data=True):
-            is_gw = (n == GATEWAY_NODE)
-            
-            # [SỬA]: Tạo HTML Tooltip cho giao diện
-            if is_gw:
-                tooltip_html = "<b>GATEWAY</b><br>Gradient: 0"
-            else:
-                tooltip_html = f"<b>Node: {n}</b><br>Gradient: {d.get('grad', '?')}<br>Tải hàng đợi (QLD): {d.get('qld', '?')}%<br>Dự đoán Pin: {d.get('pin', '?')}%"
-
-            nodes.append({
-                "id": n, 
-                "label": f"Node {n}\n(Grad: {d.get('grad', 0 if is_gw else '?')})", 
-                "color": "red" if is_gw else d.get('color', 'blue'),
-                "level": 0 if is_gw else (int(d.get('grad', 3)) if str(d.get('grad')).isdigit() else 3),
-                "title": tooltip_html # Truyền biến title cho chức năng Hover của Vis.js
-            })
-        
-        edges = []
-        for u, v, d in Master_Graph.edges(data=True):
-            is_p = d.get('is_parent')
-            label_text = f"{d.get('rssi')}dBm\n{d.get('link_uptime', '?')}s"
-            
-            edges.append({
-                "from": u, "to": v, "label": label_text, 
-                "width": 3 if is_p else 1, "dashes": not is_p, 
-                "color": "red" if is_p else "gray", "physics": is_p
-            })
-    return json.dumps({"nodes": nodes, "edges": edges})
+        before_data = serialize_graph(Master_Graph)
+        after_data = serialize_graph(SDN_Graph)
+    return json.dumps({"before": before_data, "after": after_data})
 
 @app.get("/")
 async def get_dashboard():
