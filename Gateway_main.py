@@ -215,13 +215,19 @@ def handle_csv_log(line):
         row = [now_ts, log_type, "", "", "", "", "", "", "", "", "", "", "", "", ""]
 
         if log_type == "DATA":
-            if len(parts) >= 8:
+            # [FIX] Changed from 8 to 7 because the printk payload has 7 fields after CSV_LOG,
+            if len(parts) >= 7:
                 src_val = safe_int_convert(parts[1])
                 sender_val = safe_int_convert(parts[2])
                 seq_val = safe_int_convert(parts[3])
-                hops = parts[4]
-                lat = parts[5]
-                rssi = parts[7] if len(parts) > 7 else parts[6]
+                
+                # Sanitize numeric fields in case of UART mangling (strip non-numeric except minus sign)
+                def sanitize_num(s):
+                    return re.sub(r'[^0-9\-]', '', str(s))
+
+                hops = sanitize_num(parts[4])
+                lat = sanitize_num(parts[5]) # Dummy delay
+                rssi = sanitize_num(parts[6]) # PathMinRSSI
                 
                 src_hex = f"0x{src_val:04x}"
                 if src_hex not in rx_stats: rx_stats[src_hex] = set()
