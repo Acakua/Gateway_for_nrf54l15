@@ -380,7 +380,8 @@ def stress_processor_thread():
                 row[6] = "0"
                 row[7] = parts[7] if len(parts) > 7 else (parts[6] if len(parts) > 6 else "-99")
                 latency_sync_cache[(src_hex, seq_val)] = len(stress_rows_buffer)
-                stress_rows_buffer.append(row)
+                if isinstance(stress_rows_buffer, list):
+                    stress_rows_buffer.append(row)
                 if src_hex not in rx_stats: rx_stats[src_hex] = set()
                 rx_stats[src_hex].add(seq_val)
 

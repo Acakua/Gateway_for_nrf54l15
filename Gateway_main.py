@@ -71,6 +71,7 @@ latency_sync_cache = {} # { (SourceAddr, Seq): row_index }
 rx_stats = {}           # { SourceAddr: set(Seq) }
 reported_nodes = set()  # { (SourceAddr, TxCount) }
 test_stop_time = None   # [NEW] Timer for delayed export
+total_control_packets = 0 # [NEW] Counter for all commands sent (topo_req, backprop, etc.)
 
 graph_lock = threading.Lock()
 serial_lock = threading.Lock() 
@@ -195,14 +196,15 @@ def uart_reader_thread():
             time.sleep(1)
 
 def send_uart_command(cmd):
-    global global_ser
+    global global_ser, total_control_packets
     if global_ser and global_ser.is_open:
         try:
             with serial_lock:
                 global_ser.write(f"{cmd}\r\n".encode())
                 global_ser.flush() 
+                total_control_packets += 1
                 time.sleep(0.05) 
-            print(f"[UART TX] Đã nã lệnh: {cmd}")
+            print(f"[UART TX] Đã nã lệnh: {cmd} (Tổng cộng: {total_control_packets})")
         except Exception as e:
             print(f"[UART TX] Lỗi: {e}")
 
@@ -220,15 +222,17 @@ def execute_hybrid_push(delta_nodes):
     if K <= 13:
         print("[AI SDN] K <= 13 -> Dùng chiến lược UNICAST đẩy lệnh.")
         for node, new_parent in delta_nodes:
-            payload = 0x8000 | int(new_parent, 16)
+            new_parent_int = int(str(new_parent), 16)
+            payload = 0x8000 | new_parent_int
             cmd = f"mesh backprop {node} {payload}"
             send_uart_command(cmd)
             time.sleep(0.5) 
     else:
         print(f"[AI SDN] K = {K} > 13 -> Dùng chiến lược BROADCAST gộp lệnh.")
         hex_payload = ""
-        for node, new_parent in delta_nodes:
-            hex_payload += f"{node}{new_parent}"
+        if isinstance(delta_nodes, list):
+            for node, new_parent in delta_nodes:
+                hex_payload += f"{node}{new_parent}"
         cmd = f"mesh backprop_broadcast {hex_payload}"
         send_uart_command(cmd)
         
@@ -555,10 +559,9 @@ def stress_processor_thread():
                 row[7] = parts[7] if len(parts) > 7 else (parts[6] if len(parts) > 6 else "-99")
                 
                 latency_sync_cache[(src_hex, seq_val)] = len(stress_rows_buffer)
-                stress_rows_buffer.append(row)
-                
-                if src_hex not in rx_stats:
-                    rx_stats[src_hex] = set()
+                if isinstance(stress_rows_buffer, list):
+                    stress_rows_buffer.append(row)
+                if src_hex not in rx_stats: rx_stats[src_hex] = set()
                 rx_stats[src_hex].add(seq_val)
 
             elif log_type == "RTT_DATA" and len(parts) >= 4:
@@ -730,6 +733,15 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[Hệ Thống] Đang dừng Gateway...")
     finally:
+        # Ghi nhận số gói tin điều khiển vào cuối file Topo Log trước khi thoát
+        if total_control_packets > 0:
+            try:
+                with open(RAM_DISK_CSV, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["SESSION_SUMMARY", "Total Control Packets Sent", "", "", "", "", "", "", "", "", "", total_control_packets])
+                print(f"[Hệ Thống] Đã lưu tổng kết: {total_control_packets} gói tin điều khiển vào {RAM_DISK_CSV}")
+            except: pass
+
         if stress_rows_buffer:
             print("[Hệ Thống] Đang thực hiện lưu log stress test cuối cùng...")
             export_stress_log()
