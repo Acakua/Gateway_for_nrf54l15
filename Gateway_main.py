@@ -30,13 +30,11 @@ SESSION_ID = time.strftime("%Y%m%d_%H%M%S")
 
 if os.name == 'nt':  
     SERIAL_PORT = r'\\.\COM32' 
-    RAM_DISK_CSV = f'topology_log_{SESSION_ID}.csv'
-    PERFORMANCE_CSV = f'performance_log_{SESSION_ID}.csv'
+    RAM_DISK_CSV = f'topology_log_{SESSION_ID}.csv' 
     BACKUP_DIR = 'wsn_backup\\' 
 else:                
     SERIAL_PORT = '/dev/serial0'
-    RAM_DISK_CSV = f'/dev/shm/topology_log_{SESSION_ID}.csv'
-    PERFORMANCE_CSV = f'/dev/shm/performance_log_{SESSION_ID}.csv'
+    RAM_DISK_CSV = f'/dev/shm/topology_log_{SESSION_ID}.csv' 
     BACKUP_DIR = '/home/pi/wsn_backup/'
 
 # [UPD]: Regex bắt 11 nhóm (Drop_Count giờ là uint16, max 65535)
@@ -44,11 +42,13 @@ else:
 TOPO_PATTERN = r"\$\[TOPO\],([0-9A-F]{4}),(\d+),(\d+),(\d+),(\d+),(\d+),([0-9A-F]{4}),(\d+),(\d+),(\d+),(\d+),(.*)"
 NEIGHBOR_PATTERN = r"\[([0-9A-F]{4}),(-?\d+),(\d+),(\d+)\]"
 
-# [NEW] Regex cho các loại log mới từ sink_logger.py
-DATA_LOG_PATTERN = r"CSV_LOG,DATA,([^,]+),([^,]+),(\d+),(\d+),(\d+),(-?\d+)"
-RTT_LOG_PATTERN = r"CSV_LOG,RTT_DATA,([^,]+),(\d+),([\d\.]+)"
-HB_LOG_PATTERN = r"CSV_LOG,HEARTBEAT,([^,]+),([^,]+),(\d+),([\d\.]+)"
-REPORT_LOG_PATTERN = r"CSV_LOG,REPORT,([^,]+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)"
+# [NEW] Stress Test Log Configuration
+STRESS_LOG_HEADERS = [
+    "Timestamp", "Type", "SourceAddr", "SenderAddr", "Seq_or_TxCount",
+    "HopCount", "Latency_ms", "PathMinRSSI", "BeaconTx", "HeartbeatTx",
+    "RouteChanges", "FwdCount", "Rx_Unique_Count", "Remote_Rx_Count", "PDR_Percent"
+]
+STRESS_LOG_DIR = BACKUP_DIR # Store stress logs in the backup directory
 
 # ==========================================
 # BIẾN TOÀN CỤC & KHÓA AN TOÀN
@@ -64,12 +64,13 @@ current_cycle_data = {}          # Fixed global warning
 page_assembly = {}               # Fixed global warning
 pending_commit = False           # Flag for Phase 2 piggyback
 
-# --- [NEW] DATA LOGGING CACHE (Ported from sink_logger.py) ---
-rx_stats = {}           # { src_hex: set(seq) }
-latency_tracker = {}    # { src_hex: rtt_ms }
-node_report_cache = {}  # { src_hex: { 'beacon_tx': val, 'hb_tx': val, ... } }
-latency_sync_cache = {} # { (src_hex, seq): timestamp }
-reported_nodes = set()  # To avoid duplicate reports in one cycle
+# [NEW] Stress Test Buffers & Queues
+stress_queue = queue.Queue()
+stress_rows_buffer = []
+latency_sync_cache = {} # { (SourceAddr, Seq): row_index }
+rx_stats = {}           # { SourceAddr: set(Seq) }
+reported_nodes = set()  # { (SourceAddr, TxCount) }
+test_stop_time = None   # [NEW] Timer for delayed export
 
 graph_lock = threading.Lock()
 serial_lock = threading.Lock() 
@@ -161,159 +162,6 @@ def compute_routing_cost_per_link(grad, nb_rssi, nb_link_up_s, drop_rate, pin, d
     total = hop_cost + signal_cost + reliability_cost + battery_cost + stability_cost
     return round(total, 2)
 
-# --- [NEW] HELPER FUNCTIONS FOR CSV_LOG PARSING ---
-def safe_int_convert(val):
-    try:
-        if val is None: return 0
-        s = str(val).strip()
-        if not s: return 0
-        if s.lower().startswith('0x'): return int(s, 16)
-        # remove potential decimal for int conversion (e.g. "12.0")
-        if '.' in s: s = s.split('.')[0]
-        return int(s)
-    except: return 0
-
-def safe_float_convert(val):
-    try:
-        if val is None: return 0.0
-        s = str(val).strip()
-        if not s: return 0.0
-        return float(s)
-    except: return 0.0
-
-def write_performance_log(row_data):
-    """
-    Ghi dữ liệu vào file performance_log theo định dạng FINAL_LATENCY.
-    row_data: list khớp với các cột header.
-    """
-    try:
-        file_exists = os.path.isfile(PERFORMANCE_CSV)
-        with open(PERFORMANCE_CSV, 'a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow([
-                    "Timestamp", "Type", "SourceAddr", "SenderAddr", 
-                    "Seq_or_TxCount", "HopCount", "Latency_ms", "PathMinRSSI", 
-                    "BeaconTx", "HeartbeatTx", "RouteChanges", "FwdCount", 
-                    "Rx_Unique_Count", "Remote_Rx_Count", "PDR_Percent"
-                ])
-            writer.writerow(row_data)
-    except Exception as e:
-        print(f"[PERF LOG ERROR] {e}")
-
-def handle_csv_log(line):
-    global rx_stats, latency_tracker, node_report_cache, latency_sync_cache, reported_nodes
-    now_ts = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
-    try:
-        if "CSV_LOG," not in line: return
-        raw_data = line.split("CSV_LOG,")[1]
-        parts = raw_data.split(',')
-        if not parts: return
-        log_type = parts[0].strip()
-
-        # row template: [Timestamp, Type, SourceAddr, SenderAddr, Seq_or_TxCount, HopCount, Latency_ms, PathMinRSSI, ...]
-        row = [now_ts, log_type, "", "", "", "", "", "", "", "", "", "", "", "", ""]
-
-        if log_type == "DATA":
-            # [FIX] Changed from 8 to 7 because the printk payload has 7 fields after CSV_LOG,
-            if len(parts) >= 7:
-                src_val = safe_int_convert(parts[1])
-                sender_val = safe_int_convert(parts[2])
-                seq_val = safe_int_convert(parts[3])
-                
-                # Sanitize numeric fields in case of UART mangling (strip non-numeric except minus sign)
-                def sanitize_num(s):
-                    return re.sub(r'[^0-9\-]', '', str(s))
-
-                hops = sanitize_num(parts[4])
-                lat = sanitize_num(parts[5]) # Dummy delay
-                rssi = sanitize_num(parts[6]) # PathMinRSSI
-                
-                src_hex = f"0x{src_val:04x}"
-                if src_hex not in rx_stats: rx_stats[src_hex] = set()
-                rx_stats[src_hex].add(seq_val)
-                latency_sync_cache[(src_hex, seq_val)] = time.time()
-                
-                # Fill row for immediate logging
-                row[2] = src_hex
-                row[3] = f"0x{sender_val:04x}"
-                row[4] = seq_val
-                row[5] = hops
-                row[6] = lat
-                row[7] = rssi
-                write_performance_log(row)
-
-        elif log_type == "RTT_DATA":
-            if len(parts) >= 4:
-                src_hex = f"0x{safe_int_convert(parts[1]):04x}"
-                rtt_val = safe_float_convert(parts[3])
-                latency_tracker[src_hex] = rtt_val
-                # RTT_DATA is usually a direct update, can log as event if needed
-
-        elif log_type == "HEARTBEAT":
-            if len(parts) >= 5:
-                src_hex = f"0x{safe_int_convert(parts[1]):04x}"
-                sender_hex = f"0x{safe_int_convert(parts[2]):04x}"
-                latency_tracker[src_hex] = safe_float_convert(parts[4])
-                
-                row[2] = src_hex
-                row[3] = sender_hex
-                row[5] = parts[3] # Hops
-                row[6] = parts[4] # Latency
-                write_performance_log(row)
-
-        elif log_type == "REPORT":
-            if len(parts) >= 7:
-                src_hex = f"0x{safe_int_convert(parts[1]):04x}"
-                tx_count = safe_int_convert(parts[2])
-                beacon = safe_int_convert(parts[3])
-                hb = safe_int_convert(parts[4])
-                r_chg = safe_int_convert(parts[5])
-                fwd = safe_int_convert(parts[6])
-                remote_rx = safe_int_convert(parts[7]) if len(parts) > 7 else 0
-                
-                rx_unique = len(rx_stats.get(src_hex, set()))
-                pdr = (rx_unique / tx_count * 100.0) if tx_count > 0 else 0.0
-
-                node_report_cache[src_hex] = {
-                    'tx_count': tx_count,
-                    'beacon_tx': beacon,
-                    'hb_tx': hb,
-                    'route_changes': r_chg,
-                    'fwd_count': fwd,
-                    'remote_rx': remote_rx
-                }
-                
-                # Log report summary
-                row[2] = src_hex
-                row[4] = tx_count
-                row[8] = beacon
-                row[9] = hb
-                row[10] = r_chg
-                row[11] = fwd
-                row[12] = rx_unique
-                row[13] = remote_rx
-                row[14] = f"{pdr:.2f}"
-                write_performance_log(row)
-
-        elif log_type == "EVENT":
-            if len(parts) >= 2:
-                event_name = parts[1].strip()
-                msg = parts[2].strip() if len(parts) > 2 else ""
-                if "TEST_START" in event_name:
-                    rx_stats.clear()
-                    latency_tracker.clear()
-                    latency_sync_cache.clear()
-                    reported_nodes.clear()
-                    print(f"\n[LOGGER] --- NEW TEST SESSION: {event_name} (Caches Cleared) ---")
-                
-                row[2] = event_name
-                row[3] = msg
-                write_performance_log(row)
-
-    except Exception as e:
-        print(f"[LOGGER ERROR] Parsing line {line} -> {e}")
-
 
 # ==========================================
 # KHUNG SƯỜN TÍNH TOÁN NĂNG LƯỢNG
@@ -337,9 +185,11 @@ def uart_reader_thread():
                     if global_ser.in_waiting > 0:
                         line = global_ser.readline().decode('utf-8', errors='ignore').strip()
                         if line:
-                            print(f"[RAW UART] {line}")
-                            if "$[TOPO]" in line or "CSV_LOG" in line:
+                            # print(f"[RAW UART] {line}")
+                            if "$[TOPO]" in line:
                                 uart_queue.put(line)
+                            elif "CSV_LOG" in line:
+                                stress_queue.put(line)
             time.sleep(0.01)
         except Exception:
             time.sleep(1)
@@ -435,8 +285,6 @@ def data_processor_thread():
                 page_assembly[origin]['ts'] = now 
                 if len(page_assembly[origin]['pages']) == int(total):
                     commit_topology_to_temp(origin)
-            elif "CSV_LOG" in raw_line and collecting_data:
-                handle_csv_log(raw_line)
         except queue.Empty: pass
 
 def commit_topology_to_temp(origin):
@@ -580,7 +428,6 @@ def save_to_csv_ramdisk():
                 safe_origin = f'="{origin}"'
                 safe_parent = f'="{data["parent"]}"'
                 nb_count = len(data["neighbors"])
-                
                 for nb in data["neighbors"]:
                     safe_neighbor = f'="{nb["addr"]}"'
                     heuristic_cost = compute_routing_cost_per_link(
@@ -620,16 +467,170 @@ def backup_csv_thread():
         time.sleep(BACKUP_INTERVAL)
         if os.path.exists(RAM_DISK_CSV):
             ts_now = time.strftime("%H%M%S")
-            backup_topo = f"topology_snapshot_{SESSION_ID}_{ts_now}.csv"
-            backup_perf = f"performance_snapshot_{SESSION_ID}_{ts_now}.csv"
+            backup_filename = f"topology_snapshot_{SESSION_ID}_{ts_now}.csv"
             try:
-                shutil.copy2(RAM_DISK_CSV, os.path.join(BACKUP_DIR, backup_topo))
-                if os.path.exists(PERFORMANCE_CSV):
-                    shutil.copy2(PERFORMANCE_CSV, os.path.join(BACKUP_DIR, backup_perf))
-            except Exception: pass
+                shutil.copy2(RAM_DISK_CSV, os.path.join(BACKUP_DIR, backup_filename))
+            except Exception as e:
+                pass
 
 # ==========================================
-# LUỒNG 3: FASTAPI & WEBSOCKETS CÓ WEB SERVER
+# LUỒNG 4: XỬ LÝ STRESS TEST LOG (MIMIC SINK_LOGGER)
+# ==========================================
+def safe_int_convert(val):
+    try:
+        val = str(val).strip()
+        if val.lower().startswith('0x'):
+            return int(val, 16)
+        return int(val)
+    except (ValueError, TypeError):
+        return 0
+
+def export_stress_log():
+    """Ghi lại file CSV stress test cuối cùng với mã hóa utf-8-sig."""
+    if not stress_rows_buffer:
+        return
+    
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    final_filename = os.path.join(STRESS_LOG_DIR, f"FINAL_STRESS_{SESSION_ID}_{timestamp}.csv")
+    
+    try:
+        if not os.path.exists(STRESS_LOG_DIR):
+            os.makedirs(STRESS_LOG_DIR)
+            
+        with open(final_filename, mode='w', newline='', encoding='utf-8-sig') as f:
+            w = csv.writer(f)
+            w.writerow(STRESS_LOG_HEADERS)
+            w.writerows(stress_rows_buffer)
+        print(f"\n[Hệ Thống] Đã xuất báo cáo Stress Test: {final_filename}")
+    except Exception as e:
+        print(f"[LỖI] Không thể xuất file CSV stress: {e}")
+
+def stress_processor_thread():
+    global stress_rows_buffer, latency_sync_cache, rx_stats, reported_nodes, test_stop_time
+    print("[Luồng 4] Khởi động Xử lý Stress Test Log")
+    
+    while True:
+        try:
+            # [NEW] Check if 10 minutes passed since TEST_STOP
+            if test_stop_time and (time.time() - test_stop_time > 600):
+                print("\n[STRESS] --- Hết thời gian chờ 10 phút. Đang xuất file... ---")
+                export_stress_log()
+                test_stop_time = None
+
+            line = stress_queue.get(timeout=0.1)
+            if "CSV_LOG," not in line:
+                continue
+                
+            raw_data = line.split("CSV_LOG,")[1]
+            parts = [p.strip() for p in raw_data.split(',')]
+            if not parts:
+                continue
+                
+            # Correct slicing and conversion
+            now = datetime.datetime.now().strftime('%H:%M:%S.%f')
+            now = now[:-3] if len(now) > 3 else now
+            log_type = parts[0]
+            
+            row = [""] * len(STRESS_LOG_HEADERS)
+            row[0] = now
+            row[1] = log_type
+            
+            if log_type == "DATA" and len(parts) >= 6:
+                src_val = safe_int_convert(parts[1])
+                sender_val = safe_int_convert(parts[2])
+                seq_val = safe_int_convert(parts[3])
+                
+                src_hex = f"0x{src_val:04x}"
+                sender_hex = f"0x{sender_val:04x}"
+                
+                row[2] = src_hex
+                row[3] = sender_hex
+                row[4] = str(seq_val)
+                row[5] = parts[4] # Hops
+                row[6] = "0"      # Latency (Chờ PONG report)
+                row[7] = parts[7] if len(parts) > 7 else (parts[6] if len(parts) > 6 else "-99")
+                
+                latency_sync_cache[(src_hex, seq_val)] = len(stress_rows_buffer)
+                stress_rows_buffer.append(row)
+                
+                if src_hex not in rx_stats:
+                    rx_stats[src_hex] = set()
+                rx_stats[src_hex].add(seq_val)
+
+            elif log_type == "RTT_DATA" and len(parts) >= 4:
+                src_hex = f"0x{safe_int_convert(parts[1]):04x}"
+                seq_val = safe_int_convert(parts[2])
+                rtt_val = parts[3]
+                
+                key = (src_hex, seq_val)
+                if key in latency_sync_cache:
+                    row_idx = latency_sync_cache[key]
+                    # Ensure we are modifying the list element
+                    if row_idx < len(stress_rows_buffer):
+                        stress_rows_buffer[row_idx][6] = rtt_val
+                continue # RTT_DATA chỉ để cập nhật Latency, không ghi dòng riêng
+
+            elif log_type == "HEARTBEAT" and len(parts) >= 5:
+                src_hex = f"0x{safe_int_convert(parts[1]):04x}"
+                row[2] = src_hex
+                row[3] = f"0x{safe_int_convert(parts[2]):04x}"
+                row[5] = parts[3] # Hops
+                row[6] = parts[4] # Latency
+                stress_rows_buffer.append(row)
+
+            elif log_type == "REPORT" and len(parts) >= 7:
+                src_hex = f"0x{safe_int_convert(parts[1]):04x}"
+                tx_count = parts[2]
+                report_key = (src_hex, tx_count)
+                
+                if report_key in reported_nodes:
+                    continue
+                
+                reported_nodes.add(report_key)
+                data_tx = safe_int_convert(tx_count)
+                measured_rx = len(rx_stats.get(src_hex, set()))
+                pdr = (measured_rx / data_tx * 100.0) if data_tx > 0 else 0.0
+                remote_rx = parts[7] if len(parts) > 7 else (parts[6] if len(parts) > 6 else "0")
+
+                row[2] = src_hex
+                row[4] = str(data_tx)
+                row[8] = parts[3] if len(parts) > 3 else "0"  # BeaconTx
+                row[9] = parts[4] if len(parts) > 4 else "0"  # HeartbeatTx
+                row[10] = parts[5] if len(parts) > 5 else "0" # RouteChanges
+                row[11] = parts[6] if len(parts) > 6 else "0" # FwdCount
+                row[12] = str(measured_rx) # Unique RX
+                row[13] = str(remote_rx)   # Remote RX (if any)
+                row[14] = f"{pdr:.2f}"
+                stress_rows_buffer.append(row)
+                print(f"[STRESS] Node {src_hex} Report: PDR {pdr:.2f}%")
+
+            elif "EVENT" in log_type and len(parts) >= 2:
+                event_name = parts[1]
+                msg = parts[2] if len(parts) >= 3 else ""
+                row[2] = event_name
+                row[3] = msg
+                
+                if "TEST_START" in event_name:
+                    test_stop_time = None # Cancel pending export
+                    rx_stats.clear()
+                    reported_nodes.clear()
+                    latency_sync_cache.clear()
+                    stress_rows_buffer.clear()
+                    stress_rows_buffer.append(row)
+                    print("\n[STRESS] --- PHIÊN TEST MỚI BẮT ĐẦU ---")
+                
+                elif "TEST_STOP" in event_name:
+                    stress_rows_buffer.append(row)
+                    test_stop_time = time.time()
+                    print("\n[STRESS] --- KẾT THÚC TEST. Đang chờ 10 phút để nhận nốt log... ---")
+            
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"[LUỒNG 4 LỖI] {e}")
+
+# ==========================================
+# LUỒNG 5: FASTAPI & WEBSOCKETS CÓ WEB SERVER
 # ==========================================
 def serialize_graph(g_nx):
     nodes = []
@@ -716,5 +717,13 @@ if __name__ == "__main__":
     init_serial() 
     threading.Thread(target=uart_reader_thread, daemon=True).start()
     threading.Thread(target=data_processor_thread, daemon=True).start()
+    threading.Thread(target=stress_processor_thread, daemon=True).start()
     threading.Thread(target=backup_csv_thread, daemon=True).start()
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+    except KeyboardInterrupt:
+        print("\n[Hệ Thống] Đang dừng Gateway...")
+    finally:
+        if stress_rows_buffer:
+            print("[Hệ Thống] Đang thực hiện lưu log stress test cuối cùng...")
+            export_stress_log()

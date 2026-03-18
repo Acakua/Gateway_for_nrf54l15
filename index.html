@@ -196,7 +196,7 @@
         var edgesBefore = new vis.DataSet();
         var nodesAfter = new vis.DataSet();
         var edgesAfter = new vis.DataSet();
-        
+
         var containerBefore = document.getElementById('mynetwork-before');
         var containerAfter = document.getElementById('mynetwork-after');
 
@@ -291,7 +291,7 @@
 
             ws.onmessage = function (event) {
                 var payload = JSON.parse(event.data);
-                
+
                 function updateGraph(graphData, nodesDataset, edgesDataset) {
                     var newNodes = graphData.nodes || [];
                     var newEdges = graphData.edges || [];
@@ -325,7 +325,7 @@
                     edgesDataset.update(newEdges);
                 }
 
-                if(payload.before && payload.after) {
+                if (payload.before && payload.after) {
                     updateGraph(payload.before, nodesBefore, edgesBefore);
                     updateGraph(payload.after, nodesAfter, edgesAfter);
                 } else {
